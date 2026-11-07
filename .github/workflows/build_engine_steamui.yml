@@ -1,0 +1,102 @@
+name: Build Xash3D FWGS (Windows x64, x86 and Windows XP) with the console and the loading window of the Steam menu
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # amd64 - 64-bit Windows (for the x64 packages of the client)
+          # i386  - 32-bit Windows; this build also runs on Windows XP (as the official 32-bit build of FWGS:
+          #         YY-Thunks, the C runtime linked in, subsystem 5.01), so it is for the x86 and the XP packages
+          - os: windows-latest
+            arch: amd64
+          - os: windows-2022 # the oldest image: the older compiler of the official 32-bit build
+            arch: i386
+    runs-on: ${{ matrix.os }}
+    env:
+      # the engine version this patch is made for (FWGS "continuous" of 6 November 2026). For another version change
+      # ENGINE_REF and check that the patch still applies (the step "Apply the patch" fails otherwise).
+      ENGINE_REF: e9b94dc1a89bcd8867e2d16b37cd6f1cbd4dbd1c
+      # as in .github/workflows/c-cpp.yml of that engine version
+      SDL_VERSION: 2.32.10
+      FFMPEG_VERSION: '9.0'
+      YY_THUNKS_VERSION: v1.2.1
+      GH_CPU_ARCH: ${{ matrix.arch }}
+      GH_CPU_OS: win32
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Keep line endings as is
+        run: git config --global core.autocrlf false
+
+      - name: Get this repository (contains the patch)
+        uses: actions/checkout@v5
+        with:
+          path: mypatch
+
+      - name: Get the sources of Xash3D FWGS
+        uses: actions/checkout@v5
+        with:
+          repository: FWGS/xash3d-fwgs
+          ref: ${{ env.ENGINE_REF }}
+          submodules: recursive
+          path: xash
+
+      - name: Apply the patch (the console and the loading window of the menu, see the README)
+        working-directory: xash
+        run: git apply --ignore-whitespace --whitespace=nowarn ../mypatch/xash3d_steamui.patch
+
+      - name: Install dependencies (the script of the engine: SDL2, YY-Thunks for 32-bit, FFmpeg)
+        working-directory: xash
+        run: GITHUB_WORKSPACE="$PWD" bash scripts/gha/deps_win32.sh
+
+      - name: Configure and build
+        working-directory: xash
+        run: |
+          set -e
+          EXTRA=""
+          if [ "$GH_CPU_ARCH" = "amd64" ]; then EXTRA="-8"; fi
+          if [ -d ffmpeg ]; then
+            export PKGCONFIG="$PWD/pkgconf/bin/pkgconf.exe"
+            export PKG_CONFIG_PATH="$PWD/ffmpeg/lib/pkgconfig"
+            EXTRA="$EXTRA --enable-ffmpeg --enable-ffmpeg-dlopen"
+          fi
+          # as the official build, without the tests, the tools and the text menu
+          ./waf.bat configure -s "SDL2_VC" -T release --enable-lto --enable-msvcdeps $EXTRA || { cat build/config.log; exit 1; }
+          ./waf.bat build
+          ./waf.bat install --destdir=../result
+
+      - name: Collect result
+        working-directory: xash
+        run: |
+          set -e
+          if [ "$GH_CPU_ARCH" = "i386" ]; then
+            cp -v SDL2_VC/lib/x86/SDL2.dll ../result/
+            cp -v 3rdparty/vgui_support/vgui-dev/lib/win32_vc6/vgui.dll ../result/ || true
+          else
+            cp -v SDL2_VC/lib/x64/SDL2.dll ../result/
+          fi
+          if [ -d ffmpeg ]; then cp -v ffmpeg/bin/av* ffmpeg/bin/sw* ../result/ || true; fi
+          rm -f ../result/*.pdb ../result/*.lib ../result/*.exp
+          ls -la ../result
+
+      - name: Check result (the engine with the patch)
+        working-directory: result
+        run: |
+          set -e
+          test -f xash3d.exe || { echo "ERROR: xash3d.exe is missing"; exit 1; }
+          test -f xash.dll || { echo "ERROR: xash.dll is missing"; exit 1; }
+          # the name the engine looks the menu up by: only the patched engine has it
+          grep -a -q "GetSteamUIAPI" xash.dll || { echo "ERROR: xash.dll is not built with the patch"; exit 1; }
+          echo "OK: the engine is built with the patch"
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: xash3d-fwgs-steamui-win32-${{ matrix.arch }}
+          path: result/*
