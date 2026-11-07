@@ -1,0 +1,1153 @@
+diff --git a/engine/client/cl_main.c b/engine/client/cl_main.c
+index 39e4f9c..c2d4feb 100644
+--- a/engine/client/cl_main.c
++++ b/engine/client/cl_main.c
+@@ -333,6 +333,15 @@ static void CL_CheckClientState( void )
+ 		cls.changedemo = false;		// changedemo is done
+ 		cl.first_frame = true;		// first rendering frame
+ 
++		// the loading window of the menu of the Steam version is done: to the game, as GameUI does
++		if( cls.steam_loading )
++		{
++			cls.steam_loading = false;
++			cls.steam_downloading = false;
++			if( cls.key_dest == key_menu )
++				UI_SetActiveMenu( false );
++		}
++
+ 		CL_UpdateLogo();
+ 
+ 		SCR_MakeLevelShot();		// make levelshot if needs
+@@ -1530,9 +1539,13 @@ static void CL_Connect_f( void )
+ 	Con_Printf( "server %s\n", server );
+ 	CL_Disconnect();
+ 
+-	// TESTTEST: a see console during connection
+-	UI_SetActiveMenu( false );
+-	Key_SetKeyDest( key_console );
++	// the loading window of the menu of the Steam version, else the console as before
++	if( !CL_SteamLoadingBegin( server, false ))
++	{
++		// TESTTEST: a see console during connection
++		UI_SetActiveMenu( false );
++		Key_SetKeyDest( key_console );
++	}
+ 
+ 	cls.state = ca_connecting;
+ 	cls.net_protocol = proto;
+@@ -1775,6 +1788,14 @@ This is also called on Host_Error, so it shouldn't cause any errors
+ */
+ void CL_Disconnect( void )
+ {
++	// the loading window of the menu of the Steam version: the connection failed or was cancelled
++	if( cls.steam_loading )
++	{
++		cls.steam_loading = false;
++		cls.steam_downloading = false;
++		UI_ConnectionProgress_Disconnect();
++	}
++
+ 	if( cls.state == ca_disconnected )
+ 		return;
+ 
+@@ -1931,6 +1952,9 @@ static void CL_Reconnect_f( void )
+ 
+ 	if( cls.state == ca_connected )
+ 	{
++		// the loading window of the menu of the Steam version while the next level is loaded
++		if( !cls.steam_loading && !cls.demoplayback )
++			CL_SteamLoadingBegin( NULL, true );
+ 		CL_Reconnect( false );
+ 		return;
+ 	}
+@@ -1949,6 +1973,9 @@ static void CL_Reconnect_f( void )
+ 		cls.net_protocol = proto; // don't change protocol
+ 
+ 		Con_Printf( "reconnecting...\n" );
++
++		if( !cls.steam_loading && !cls.demoplayback )
++			CL_SteamLoadingBegin( NULL, true );
+ 	}
+ }
+ 
+@@ -1979,8 +2006,11 @@ static void CL_Retry_f( void )
+ 	Con_Printf( "Commencing connection retry to %s\n", cls.servername );
+ 	CL_Disconnect();
+ 
+-	UI_SetActiveMenu( false );
+-	Key_SetKeyDest( key_console );
++	if( !CL_SteamLoadingBegin( cls.servername, false ))
++	{
++		UI_SetActiveMenu( false );
++		Key_SetKeyDest( key_console );
++	}
+ 
+ 	cls.state = ca_connecting;
+ 	cls.connect_time = MAX_HEARTBEAT; // CL_CheckForResend() will fire immediately
+@@ -2134,12 +2164,14 @@ static void CL_NetRequestComplete( net_request_t *nr, netadr_t from, const char
+ static void CL_ParseGoldSrcStatusMessage( netadr_t from, sizebuf_t *msg, qboolean legacy_format )
+ {
+ 	static char	s[512+8];
+-	int p, numcl, maxcl, password, bots;
+-	string host, map, gamedir, version;
++	int p, numcl, maxcl, password, bots, secure = 0, type, os;
++	string host, map, gamedir, version, desc;
+ 
+ 	// set to beginning but skip header
+ 	MSG_SeekToBit( msg, (sizeof( uint32_t ) + sizeof( uint8_t )) << 3, SEEK_SET );
+ 
++	version[0] = '\0';
++
+ 	if( legacy_format )
+ 	{
+ 		int mod;
+@@ -2153,31 +2185,28 @@ static void CL_ParseGoldSrcStatusMessage( netadr_t from, sizebuf_t *msg, qboolea
+ 		Q_strncpy( host, MSG_ReadString( msg ), sizeof( host ));
+ 		Q_strncpy( map, MSG_ReadString( msg ), sizeof( map ));
+ 		Q_strncpy( gamedir, MSG_ReadString( msg ), sizeof( gamedir ));
+-		MSG_ReadString( msg ); // game description
++		Q_strncpy( desc, MSG_ReadString( msg ), sizeof( desc )); // game description
+ 		numcl = MSG_ReadByte( msg );
+ 		maxcl = MSG_ReadByte( msg );
+ 		MSG_ReadByte( msg ); // protocol version
+-		MSG_ReadByte( msg ); // server type
+-		MSG_ReadByte( msg ); // operating system
++		type = MSG_ReadByte( msg ); // server type
++		os = MSG_ReadByte( msg ); // operating system
+ 		password = MSG_ReadByte( msg );
+ 		mod = MSG_ReadByte( msg ); // mod flag
+ 
++		// the obsolete GoldSrc response: the mod fields, then the anti-cheat and the bots (no version string)
+ 		if( mod == 1 )
+ 		{
+ 			MSG_ReadString( msg ); // mod URL
+ 			MSG_ReadString( msg ); // mod download URL
++			MSG_ReadByte( msg );   // a null byte
+ 			MSG_ReadLong( msg );   // mod version
+ 			MSG_ReadLong( msg );   // mod size
+ 			MSG_ReadByte( msg );   // mod type (SP/MP)
+ 			MSG_ReadByte( msg );   // custom DLL flag
+-			Q_strncpy( version, MSG_ReadString( msg ), sizeof( version ));
+-			bots = MSG_ReadByte( msg ); // bots count
+-		}
+-		else
+-		{
+-			Q_strncpy( version, MSG_ReadString( msg ), sizeof( version ));
+-			bots = MSG_ReadByte( msg ); // bots count
+ 		}
++		secure = MSG_ReadByte( msg ); // VAC
++		bots = MSG_ReadByte( msg ); // bots count
+ 	}
+ 	else
+ 	{
+@@ -2185,14 +2214,15 @@ static void CL_ParseGoldSrcStatusMessage( netadr_t from, sizebuf_t *msg, qboolea
+ 		Q_strncpy( host, MSG_ReadString( msg ), sizeof( host ));
+ 		Q_strncpy( map, MSG_ReadString( msg ), sizeof( map ));
+ 		Q_strncpy( gamedir, MSG_ReadString( msg ), sizeof( gamedir ));
+-		MSG_ReadString( msg ); // game description
++		Q_strncpy( desc, MSG_ReadString( msg ), sizeof( desc )); // game description
+ 		MSG_ReadShort( msg ); // app id
+ 		numcl = MSG_ReadByte( msg );
+ 		maxcl = MSG_ReadByte( msg );
+ 		bots = MSG_ReadByte( msg ); // bots count
+-		MSG_ReadByte( msg ); // server type
+-		MSG_ReadByte( msg ); // operating system
++		type = MSG_ReadByte( msg ); // server type
++		os = MSG_ReadByte( msg ); // operating system
+ 		password = MSG_ReadByte( msg );
++		secure = MSG_ReadByte( msg ); // VAC
+ 		Q_strncpy( version, MSG_ReadString( msg ), sizeof( version ));
+ 	}
+ 
+@@ -2218,6 +2248,21 @@ static void CL_ParseGoldSrcStatusMessage( netadr_t from, sizebuf_t *msg, qboolea
+ 	Info_SetValueForKey( s, "gamedir", gamedir, sizeof( s ));
+ 	Info_SetValueForKey( s, "password", password ? "1" : "0", sizeof( s ));
+ 
++	// for the Servers window of the menu of the Steam version: the description of the game ("Counter-Strike"),
++	// the bots, the anti-cheat, the server type (d, l, p) and its system (l, w, m)
++	{
++		char *c;
++		while(( c = Q_strpbrk( desc, "\\\"" )))
++			*c = ' ';
++	}
++	Info_SetValueForKey( s, "desc", desc, sizeof( s ));
++	Info_SetValueForKeyf( s, "bots", sizeof( s ), "%i", bots );
++	Info_SetValueForKey( s, "secure", secure ? "1" : "0", sizeof( s ));
++	if( type > 32 && type < 127 )
++		Info_SetValueForKeyf( s, "type", sizeof( s ), "%c", type );
++	if( os > 32 && os < 127 )
++		Info_SetValueForKeyf( s, "os", sizeof( s ), "%c", os );
++
+ 	// write host last so we can try to cut off too long hostnames
+ 	// TODO: value size limit for infostrings
+ 	int remaining = sizeof( s ) - Q_strlen( s ) - sizeof( "\\host\\" ) - 1;
+@@ -2249,6 +2294,8 @@ static void CL_ParseGoldSrcStatusMessage( netadr_t from, sizebuf_t *msg, qboolea
+ 	Info_SetValueForKeyf( s, "max", sizeof( s ), "%i", maxcl );
+ 	Info_SetValueForKey( s, "map", map, sizeof( s ));
+ 	Info_SetValueForKey( s, "hostname", host, sizeof( s ));
++	Info_SetValueForKey( s, "desc", desc, sizeof( s )); // for the Game Info window of the menu of the Steam version
++	Info_SetValueForKey( s, "secure", secure ? "1" : "0", sizeof( s ));
+ 
+ 	CL_NetRequestComplete( nr, from, s );
+ }
+@@ -3503,12 +3550,30 @@ qboolean CL_PrecacheResources( void )
+ 	if( cls.state != ca_active )
+ 		S_BeginRegistration();
+ 
++	// the progress for the loading window of the menu of the Steam version, drawn on while the resources load
++	int total = 0, done = 0;
++	double lastUpdate = Platform_DoubleTime();
++	for( pRes = cl.resourcesonhand.pNext; pRes && pRes != &cl.resourcesonhand; pRes = pRes->pNext )
++		if( !FBitSet( pRes->ucFlags, RES_PRECACHED ))
++			total++;
++
+ 	// precache all the remaining resources where order is doesn't matter
+ 	for( pRes = cl.resourcesonhand.pNext; pRes && pRes != &cl.resourcesonhand; pRes = pRes->pNext )
+ 	{
+ 		if( FBitSet( pRes->ucFlags, RES_PRECACHED ))
+ 			continue;
+ 
++		if( cls.steam_loading && total > 0 )
++		{
++			done++;
++			if( Platform_DoubleTime() - lastUpdate > 0.1 )
++			{
++				lastUpdate = Platform_DoubleTime();
++				Cvar_SetValue( "scr_loading", 100.0f * done / total );
++				SCR_UpdateScreen();
++			}
++		}
++
+ 		switch( pRes->type )
+ 		{
+ 		case t_sound:
+@@ -3894,6 +3959,62 @@ void Host_ClientBegin( void )
+ 	SteamBroker_Frame();
+ }
+ 
++/*
++==================
++CL_SteamLoadingBegin
++
++the loading window of the menu of the Steam version (steamui_int.h): the menu stays open while the client connects
++and loads, with the window over it; "server" is NULL for the local server. False when the menu can't do it.
++==================
++*/
++qboolean CL_SteamLoadingBegin( const char *server, qboolean changelevel )
++{
++	if( !UI_SteamFeature( STEAMUI_FEATURE_LOADING ) || cls.demoplayback || cls.changedemo )
++		return false;
++
++	if( cls.key_dest != key_menu )
++		UI_SetActiveMenu( true );
++
++	if( changelevel )
++		UI_ConnectionProgress_ChangeLevel();
++	else UI_ConnectionProgress_Connect( server );
++
++	cls.steam_loading = true;
++	cls.steam_downloading = false;
++	cls.steam_dltotal = 0;
++	return true;
++}
++
++/*
++==================
++CL_SteamLoadingFrame
++
++the files downloaded while connecting, for the loading window
++==================
++*/
++static void CL_SteamLoadingFrame( void )
++{
++	if( !cls.steam_loading )
++		return;
++
++	if( scr_download.value >= 0.0f && host.downloadfile[0] )
++	{
++		int current;
++
++		cls.steam_dltotal = Q_max( cls.steam_dltotal, host.downloadcount );
++		cls.steam_downloading = true;
++
++		current = bound( 0, cls.steam_dltotal - host.downloadcount, Q_max( 0, cls.steam_dltotal - 1 ));
++		UI_ConnectionProgress_Download( host.downloadfile, cls.servername, "", current, Q_max( 1, cls.steam_dltotal ), "" );
++	}
++	else if( cls.steam_downloading && host.downloadcount <= 0 )
++	{
++		cls.steam_downloading = false;
++		cls.steam_dltotal = 0;
++		UI_ConnectionProgress_DownloadEnd();
++	}
++}
++
+ /*
+ ==================
+ Host_ClientFrame
+@@ -3926,6 +4047,9 @@ void Host_ClientFrame( void )
+ 	// update voice
+ 	Voice_Idle( host.frametime );
+ 
++	// the files downloaded, for the loading window of the menu of the Steam version
++	CL_SteamLoadingFrame();
++
+ 	// emit visible entities
+ 	CL_EmitEntities ();
+ 
+diff --git a/engine/client/cl_scrn.c b/engine/client/cl_scrn.c
+index 602ee24..6de1615 100644
+--- a/engine/client/cl_scrn.c
++++ b/engine/client/cl_scrn.c
+@@ -496,6 +496,28 @@ void SCR_BeginLoadingPlaque( qboolean is_background )
+ 	S_StopAllSounds( true );
+ 	cl.audio_prepped = false;			// don't play ambients
+ 
++	// the loading window of the menu of the Steam version instead of the plaque: a local game started (from the
++	// menu or the console) or a level changed in the game; the screen is drawn on while loading (the menu only)
++	if( !is_background && !cls.changedemo && !cls.demoplayback && UI_SteamFeature( STEAMUI_FEATURE_LOADING ))
++	{
++		if( !cls.steam_loading )
++			CL_SteamLoadingBegin( NULL, cls.state >= ca_connected );
++
++		if( cls.steam_loading )
++		{
++			cls.draw_changelevel = false;
++			SCR_UpdateScreen();
++
++			if( cls.state == ca_disconnected || cls.disable_screen )
++				return;
++
++			cl.video_prepped = false;
++			cls.disable_screen = host.realtime;
++			cl.background = false;
++			return;
++		}
++	}
++
+ 	if( cls.key_dest == key_menu && !cls.changedemo && !is_background )
+ 	{
+ 		UI_SetActiveMenu( false );
+@@ -687,7 +709,9 @@ void SCR_UpdateScreen( void )
+ 		break;
+ 	case ca_active:
+ 		Con_RunConsole ();
+-		V_RenderView();
++		// a level is loaded under the loading window of the menu of the Steam version: the menu only
++		if( !( cls.steam_loading && cls.disable_screen ))
++			V_RenderView();
+ 		break;
+ 	case ca_cinematic:
+ 		SCR_DrawCinematic();
+diff --git a/engine/client/cl_view.c b/engine/client/cl_view.c
+index b428096..78b640a 100644
+--- a/engine/client/cl_view.c
++++ b/engine/client/cl_view.c
+@@ -335,8 +335,9 @@ qboolean V_PreRender( void )
+ 	if( host.status == HOST_SLEEP )
+ 		return false;
+ 
+-	// if the screen is disabled (loading plaque is up)
+-	if( cls.disable_screen )
++	// if the screen is disabled (loading plaque is up); the loading window of the menu of the Steam version is drawn
++	// on while loading, the world is not (SCR_UpdateScreen, V_PostRender)
++	if( cls.disable_screen && !cls.steam_loading )
+ 	{
+ 		if(( host.realtime - cls.disable_screen ) > cl_timeout.value )
+ 		{
+@@ -537,7 +538,7 @@ void V_PostRender( void )
+ 	ref.dllFuncs.R_AllowFog( false );
+ 	ref.dllFuncs.R_Set2DMode( true );
+ 
+-	if( cls.state == ca_active && cls.signon == SIGNONS && cls.scrshot_action != scrshot_mapshot )
++	if( cls.state == ca_active && cls.signon == SIGNONS && cls.scrshot_action != scrshot_mapshot && !( cls.steam_loading && cls.disable_screen ))
+ 	{
+ 		SCR_TileClear();
+ 		CL_DrawHUD( CL_ACTIVE );
+diff --git a/engine/client/client.h b/engine/client/client.h
+index ecb69a1..072a7fc 100644
+--- a/engine/client/client.h
++++ b/engine/client/client.h
+@@ -20,6 +20,7 @@ GNU General Public License for more details.
+ #include "xash3d_mathlib.h"
+ #include "cdll_int.h"
+ #include "menu_int.h"
++#include "steamui_int.h"
+ #include "cl_entity.h"
+ #include "mod_local.h"
+ #include "pmove.h"
+@@ -535,6 +536,10 @@ typedef struct
+ 	float		logo_length;
+ 
+ 	qboolean use_extended_api;
++
++	// the menu of the Steam version (steamui_int.h): its console window and its loading window
++	steamui_functions_t steamFuncs;
++	qboolean use_steamui;
+ } gameui_static_t;
+ 
+ typedef struct bandwidth_test_s
+@@ -551,6 +556,9 @@ typedef struct
+ 	connstate_t	state;
+ 	qboolean		initialized;
+ 	qboolean		changelevel;		// during changelevel
++	qboolean		steam_loading;		// the loading window of the menu of the Steam version is shown
++	qboolean		steam_downloading;	// ... with the files that are downloaded
++	int		steam_dltotal;		// the files to download, for that window
+ 	qboolean		changedemo;		// during changedemo
+ 	double		timestart;		// just for profiling
+ 
+@@ -798,6 +806,7 @@ void CL_UpdateFrameLerp( void );
+ int CL_IsDevOverviewMode( void );
+ void CL_SignonReply( connprotocol_t proto );
+ void CL_ClearState( void );
++qboolean CL_SteamLoadingBegin( const char *server, qboolean changelevel );
+ void CL_SetCheatState( qboolean multiplayer, qboolean allow_cheats );
+ void CL_SendGoldSrcConnectPacket( netadr_t adr, int challenge, const void *ticket, size_t ticketlen );
+ void CL_NotifyServerListResponse( void );
+@@ -1146,6 +1155,9 @@ void Con_CharEvent( int key );
+ void Key_Console( int key );
+ void Key_Message( int key );
+ void Con_FastClose( void );
++void Con_SteamReplay( void );
++void Con_SteamCommand( const char *line );
++int Con_SteamCompletion( const char *partial, char *out, int outsize, int max );
+ void Con_Bottom( void );
+ void Con_PageDown( int lines );
+ void Con_PageUp( int lines );
+@@ -1204,6 +1216,11 @@ void UI_ConnectionProgress_Precache( void );
+ void UI_ConnectionProgress_Connect( const char *server );
+ void UI_ConnectionProgress_ChangeLevel( void );
+ void UI_ConnectionProgress_ParseServerInfo( const char *server );
++qboolean UI_SteamFeature( int feature );
++void UI_SteamConsoleShow( qboolean show );
++qboolean UI_SteamConsoleVisible( void );
++void UI_SteamConsolePrint( const char *text );
++void UI_SteamConsoleClear( void );
+ char **GAME_EXPORT CL_GetFilesList( const char *pattern, int *numFiles, int gamedironly ); // used by both UI and Render APIs
+ 
+ //
+diff --git a/engine/client/console.c b/engine/client/console.c
+index c7b35c5..feb4881 100644
+--- a/engine/client/console.c
++++ b/engine/client/console.c
+@@ -15,6 +15,7 @@ GNU General Public License for more details.
+ 
+ #include "common.h"
+ #include "client.h"
++#include "library.h" // COM_GetProcAddress
+ #include "keydefs.h"
+ #include "protocol.h"		// get the protocol version
+ #include "con_nprint.h"
+@@ -214,6 +215,7 @@ Con_Clear_f
+ */
+ static void Con_Clear_f( void )
+ {
++	UI_SteamConsoleClear();
+ 	con.lines_count = 0;
+ 	con.backscroll = 0; // go to end
+ 	Con_ClearSelection();
+@@ -310,6 +312,28 @@ void Con_ToggleConsole_f( void )
+ 	if( !host.allow_console || UI_CreditsActive( ))
+ 		return; // disabled
+ 
++	// the console window of the menu of the Steam version: the menu opens with it, as GameUI does; closed in a
++	// game it goes back to the game, else only the window closes
++	if( UI_SteamFeature( STEAMUI_FEATURE_CONSOLE ))
++	{
++		Con_ClearTyping();
++		Con_ClearNotify();
++
++		if( cls.key_dest == key_menu && UI_SteamConsoleVisible( ))
++		{
++			if( cls.state == ca_active && !Con_BackgroundMapActive( ))
++				UI_SetActiveMenu( false );
++			else UI_SteamConsoleShow( false );
++		}
++		else
++		{
++			if( cls.key_dest != key_menu )
++				UI_SetActiveMenu( true );
++			UI_SteamConsoleShow( true );
++		}
++		return;
++	}
++
+ 	SCR_EndLoadingPlaque();
+ 
+ 	// show console only in game, from menu, or to close console
+@@ -982,6 +1006,9 @@ void Con_Print( const char *txt )
+ 		txt++;
+ 	}
+ 
++	// the console window of the menu gets the text too
++	UI_SteamConsolePrint( txt );
++
+ 	for( ; *txt; txt++ )
+ 	{
+ 		if( cr_pending )
+@@ -2241,6 +2268,25 @@ static void Con_DrawNotify( void )
+ 		if( clgame.dllFuncs.pfnChatInputPosition )
+ 			clgame.dllFuncs.pfnChatInputPosition( &x, &y );
+ 
++		// the client draws the line itself with the font of its chat (cs16-client, as the Steam version)
++		if( clgame.hInstance )
++		{
++			static void *lastInstance;
++			static int ( *pfnDrawChatInput )( int x, int y, const char *cmd, const char *text, int cursor );
++
++			if( lastInstance != clgame.hInstance )
++			{
++				lastInstance = clgame.hInstance;
++				pfnDrawChatInput = COM_GetProcAddress( clgame.hInstance, "HUD_DrawChatInput" );
++			}
++
++			if( pfnDrawChatInput && pfnDrawChatInput( x, y, con.chat_cmd, con.chat.buffer, con.chat.cursor ))
++			{
++				ref.dllFuncs.Color4ub( 255, 255, 255, 255 );
++				return;
++			}
++		}
++
+ 		Q_snprintf( buf, sizeof( buf ), "%s: ", con.chat_cmd );
+ 
+ 		Con_DrawStringLen( buf, &len, NULL );
+@@ -2433,7 +2479,10 @@ void Con_DrawConsole( void )
+ 
+ 	if( cls.state == ca_connecting || cls.state == ca_connected )
+ 	{
+-		if( !cl_allow_levelshots.value && !cls.timedemo )
++		// the loading window of the menu of the Steam version is over the menu: no console over them
++		if( cls.steam_loading || ( cls.key_dest == key_menu && UI_SteamFeature( STEAMUI_FEATURE_CONSOLE )))
++			con.vislines = con.showlines = 0;
++		else if( !cl_allow_levelshots.value && !cls.timedemo )
+ 		{
+ 			if( cls.key_dest != key_console && Con_BackgroundMapActive( ))
+ 				con.vislines = con.showlines = 0;
+@@ -2454,6 +2503,14 @@ void Con_DrawConsole( void )
+ 	case ca_disconnected:
+ 		if( cls.key_dest != key_menu )
+ 		{
++			if( UI_SteamFeature( STEAMUI_FEATURE_CONSOLE ))
++			{
++				// the menu of the Steam version: its main menu and its console window, not the console of the engine
++				UI_SetActiveMenu( true );
++				if( cls.key_dest == key_console )
++					UI_SteamConsoleShow( true );
++				break;
++			}
+ 			Con_DrawSolidConsole( refState.height );
+ 			Key_SetKeyDest( key_console );
+ 		}
+@@ -2911,3 +2968,186 @@ void Test_RunCon( void )
+ }
+ 
+ #endif /* XASH_ENGINE_TESTS */
++
++/*
++==============================================================================
++
++THE CONSOLE WINDOW OF THE MENU OF THE STEAM VERSION (steamui_int.h)
++
++==============================================================================
++*/
++/*
++================
++Con_SteamReplay
++
++the text printed before the menu was loaded, for its console window
++================
++*/
++void Con_SteamReplay( void )
++{
++	if( !con.initialized || !con.buffer )
++		return;
++
++	for( int i = 0; i < CON_LINES_COUNT; i++ )
++	{
++		const con_lineinfo_t *l = &CON_LINES( i );
++		char line[MAX_PRINT_MSG + 2];
++		size_t len = Q_min( l->length, sizeof( line ) - 2 );
++
++		memcpy( line, l->start, len );
++		if( !l->wrapped )
++			line[len++] = '\n';
++		line[len] = '\0';
++		UI_SteamConsolePrint( line );
++	}
++}
++
++/*
++================
++Con_SteamCommand
++
++a line typed in the console window of the menu
++================
++*/
++void GAME_EXPORT Con_SteamCommand( const char *line )
++{
++	field_t f;
++
++	if( !line )
++		return;
++
++	Con_ClearField( &f );
++	f.cursor = Q_strncpy( f.buffer, line, sizeof( f.buffer ));
++	COM_RemoveLineFeed( f.buffer, sizeof( f.buffer ));
++
++	// echo as the console of GoldSrc does
++	Con_Printf( "] %s\n", f.buffer );
++
++	if( f.buffer[0] == '\\' || ( f.buffer[0] == '/' && f.buffer[1] != '/' ))
++		Cbuf_AddText( f.buffer + 1 );
++	else Cbuf_AddText( f.buffer );
++	Cbuf_AddText( "\n" );
++
++	if( !con.historyLoaded )
++	{
++		Con_LoadHistory( &con.history );
++		con.historyLoaded = true;
++	}
++	Con_HistoryAppend( &con.history, &f );
++}
++
++typedef struct
++{
++	const char *partial;
++	size_t      len;
++	string      names[64];
++	string      values[64];
++	int         count;
++	int         max;
++} steamcompletion_t;
++
++static void Con_SteamCompletionAdd( steamcompletion_t *c, const char *name, const char *value )
++{
++	int i, j;
++
++	if( !name || Q_strnicmp( name, c->partial, c->len ))
++		return;
++
++	// already there (an alias and a command of the same name)
++	for( i = 0; i < c->count; i++ )
++		if( !Q_stricmp( c->names[i], name ))
++			return;
++
++	// sorted, the first "max" of them
++	for( i = 0; i < c->count; i++ )
++		if( Q_stricmp( name, c->names[i] ) < 0 )
++			break;
++
++	if( i >= c->max )
++		return;
++
++	if( c->count < c->max )
++		c->count++;
++
++	for( j = c->count - 1; j > i; j-- )
++	{
++		Q_strncpy( c->names[j], c->names[j - 1], sizeof( c->names[j] ));
++		Q_strncpy( c->values[j], c->values[j - 1], sizeof( c->values[j] ));
++	}
++
++	Q_strncpy( c->names[i], name, sizeof( c->names[i] ));
++	if( value )
++		Q_strncpy( c->values[i], value, sizeof( c->values[i] ));
++	else c->values[i][0] = '\0';
++}
++
++static void Con_SteamCompletionCmd( const char *name, const void *func, const void *unused, void *ptr )
++{
++	steamcompletion_t *c = ptr;
++
++	// no hidden commands
++	if( !name || name[0] == '_' || name[0] == '@' )
++		return;
++
++	Con_SteamCompletionAdd( c, name, NULL );
++}
++
++static void Con_SteamCompletionVar( const char *name, const void *value, const void *unused, void *ptr )
++{
++	steamcompletion_t *c = ptr;
++	convar_t *cv = Cvar_FindVar( name );
++
++	if( cv && FBitSet( cv->flags, FCVAR_PROTECTED ))
++		value = NULL; // a password: its value is not shown
++
++	Con_SteamCompletionAdd( c, name, value ? value : "" );
++}
++
++/*
++================
++Con_SteamCompletion
++
++the commands and the variables beginning with "partial" (see steamui_int.h)
++================
++*/
++int GAME_EXPORT Con_SteamCompletion( const char *partial, char *out, int outsize, int max )
++{
++	steamcompletion_t *c;
++	size_t pos = 0;
++	int count;
++
++	if( !out || outsize <= 0 )
++		return 0;
++	out[0] = '\0';
++
++	if( !partial || !partial[0] )
++		return 0;
++
++	c = Mem_Calloc( host.mempool, sizeof( *c ));
++	c->partial = partial;
++	c->len = Q_strlen( partial );
++	c->max = bound( 1, max, (int)ARRAYSIZE( c->names ));
++
++	Cmd_LookupCmds( NULL, c, Con_SteamCompletionCmd );
++	Cvar_LookupVars( 0, NULL, c, Con_SteamCompletionVar );
++
++	for( int i = 0; i < c->count; i++ )
++	{
++		int n;
++		if( Cvar_FindVar( c->names[i] ))
++			n = Q_snprintf( out + pos, outsize - pos, "%s\t%s\n", c->names[i], c->values[i] );
++		else
++			n = Q_snprintf( out + pos, outsize - pos, "%s\n", c->names[i] );
++
++		if( n < 0 || pos + n >= (size_t)outsize )
++		{
++			out[pos] = '\0';
++			break;
++		}
++		pos += n;
++	}
++
++	count = c->count;
++	Mem_Free( c );
++	return count;
++}
+diff --git a/engine/client/dll_int/cl_gameui.c b/engine/client/dll_int/cl_gameui.c
+index 993304f..a3ea1d3 100644
+--- a/engine/client/dll_int/cl_gameui.c
++++ b/engine/client/dll_int/cl_gameui.c
+@@ -275,6 +275,59 @@ void UI_ConnectionProgress_ChangeLevel( void )
+ 	}
+ }
+ 
++/*
++=======================
++the menu of the Steam version (steamui_int.h)
++=======================
++*/
++qboolean UI_SteamFeature( int feature )
++{
++	if( !gameui.hInstance || !gameui.use_steamui || !gameui.steamFuncs.pfnGetFeatures )
++		return false;
++	return FBitSet( gameui.steamFuncs.pfnGetFeatures( ), feature ) != 0;
++}
++
++void UI_SteamConsoleShow( qboolean show )
++{
++	if( UI_SteamFeature( STEAMUI_FEATURE_CONSOLE ) && gameui.steamFuncs.pfnConsoleShow )
++		gameui.steamFuncs.pfnConsoleShow( show );
++}
++
++qboolean UI_SteamConsoleVisible( void )
++{
++	if( UI_SteamFeature( STEAMUI_FEATURE_CONSOLE ) && gameui.steamFuncs.pfnConsoleVisible )
++		return gameui.steamFuncs.pfnConsoleVisible( ) != 0;
++	return false;
++}
++
++void UI_SteamConsolePrint( const char *text )
++{
++	// always: the menu keeps the text even while its console window is not used (the menu of the Steam version off)
++	if( gameui.hInstance && gameui.use_steamui && gameui.steamFuncs.pfnConsolePrint && text && text[0] )
++		gameui.steamFuncs.pfnConsolePrint( text );
++}
++
++void UI_SteamConsoleClear( void )
++{
++	if( gameui.hInstance && gameui.use_steamui && gameui.steamFuncs.pfnConsoleClear )
++		gameui.steamFuncs.pfnConsoleClear( );
++}
++
++static void GAME_EXPORT pfnSteamSetClipboardText( const char *text )
++{
++	if( text )
++		Platform_SetClipboardText( text );
++}
++
++static const steamui_enginefuncs_t gSteamUIEngfuncs =
++{
++	pfnSteamSetClipboardText,
++	Con_SteamCompletion,
++	Con_SteamCommand,
++	Voice_Test,
++	Voice_TestLevel,
++};
++
+ void UI_ConnectionProgress_ParseServerInfo( const char *server )
+ {
+ 	if( gameui.dllFuncs2.pfnConnectionProgress_ParseServerInfo )
+@@ -1440,6 +1493,20 @@ qboolean UI_LoadProgs( void )
+ 		}
+ 	}
+ 
++	// the menu of the Steam version: its console window and its loading window (steamui_int.h)
++	gameui.use_steamui = false;
++	memset( &gameui.steamFuncs, 0, sizeof( gameui.steamFuncs ));
++	if( gameui.use_extended_api )
++	{
++		STEAMUIAPI GetSteamUIAPI = (STEAMUIAPI)COM_GetProcAddress( gameui.hInstance, STEAMUI_EXPORT_NAME );
++
++		if( GetSteamUIAPI && GetSteamUIAPI( STEAMUI_API_VERSION, &gameui.steamFuncs, &gSteamUIEngfuncs ))
++		{
++			Con_Reportf( "%s: Steam UI API initialized\n", __func__ );
++			gameui.use_steamui = true;
++		}
++	}
++
+ 	Cvar_FullSet( "host_gameuiloaded", "1", FCVAR_READ_ONLY );
+ 	Cmd_AddRestrictedCommand( "ui_allowconsole", UI_ToggleAllowConsole_f, "unlocks developer console" );
+ 
+@@ -1451,5 +1518,9 @@ qboolean UI_LoadProgs( void )
+ 	// initialize game
+ 	gameui.dllFuncs.pfnInit();
+ 
++	// the console window of the menu gets what was printed before it
++	if( gameui.use_steamui )
++		Con_SteamReplay();
++
+ 	return true;
+ }
+diff --git a/engine/client/input/in_keys.c b/engine/client/input/in_keys.c
+index 82f733b..9e276fd 100644
+--- a/engine/client/input/in_keys.c
++++ b/engine/client/input/in_keys.c
+@@ -1095,6 +1095,9 @@ void CL_CharEvent( int key )
+ 	}
+ 	else if( cls.key_dest == key_menu )
+ 	{
++		// the key of the console opens and closes the console window of the menu of the Steam version: not typed in it
++		if((( char )key == '`' || ( char )key == '~' ) && UI_SteamFeature( STEAMUI_FEATURE_CONSOLE ))
++			return;
+ 		UI_CharEvent( key );
+ 	}
+ }
+diff --git a/engine/client/parse/cl_parse.c b/engine/client/parse/cl_parse.c
+index 61de1f4..9b26d12 100644
+--- a/engine/client/parse/cl_parse.c
++++ b/engine/client/parse/cl_parse.c
+@@ -792,6 +792,10 @@ static void CL_ParseServerData( sizebuf_t *msg, connprotocol_t proto )
+ 	cls.timestart = Platform_DoubleTime();
+ 	cls.demowaiting = false;	// server is changed
+ 
++	// the loading window of the menu of the Steam version: the server is known
++	if( cls.steam_loading )
++		UI_ConnectionProgress_ParseServerInfo( cls.servername );
++
+ 	// wipe the client_t struct
+ 	if( !cls.changelevel && !cls.changedemo )
+ 		CL_ClearState ();
+@@ -1677,6 +1681,10 @@ void CL_RegisterResources( sizebuf_t *msg, connprotocol_t proto )
+ 		return;
+ 	}
+ 
++	// the loading window of the menu of the Steam version: the resources are loaded
++	if( cls.steam_loading )
++		UI_ConnectionProgress_Precache();
++
+ 	if( !cls.demoplayback )
+ 		CL_SendConsistencyInfo( msg, proto );
+ 
+@@ -2590,6 +2598,10 @@ void CL_ParseServerMessage( sizebuf_t *msg )
+ 
+ 				Con_Printf( "Server changing, reconnecting\n" );
+ 
++				// the loading window of the menu of the Steam version while the next level is loaded
++				if( !cls.demoplayback && !cls.steam_loading )
++					CL_SteamLoadingBegin( NULL, true );
++
+ 				if( cls.demoplayback )
+ 				{
+ 					SCR_BeginLoadingPlaque( cl.background );
+diff --git a/engine/client/sound.h b/engine/client/sound.h
+index d14664e..4339429 100644
+--- a/engine/client/sound.h
++++ b/engine/client/sound.h
+@@ -56,6 +56,7 @@ extern convar_t s_lerping;
+ extern convar_t s_test;  // cvar to test new effects
+ extern convar_t s_samplecount;
+ extern convar_t s_warn_late_precache;
++extern convar_t loadas8bit;
+ extern convar_t snd_mute_losefocus;
+ 
+ wavdata_t *S_LoadSound( sfx_t *sfx );
+diff --git a/engine/client/sound/s_load.c b/engine/client/sound/s_load.c
+index 25e1e88..d58d87d 100644
+--- a/engine/client/sound/s_load.c
++++ b/engine/client/sound/s_load.c
+@@ -134,6 +134,10 @@ wavdata_t *S_LoadSound( sfx_t *sfx )
+ 	else if( sc->rate > SOUND_22k && sc->rate != SOUND_44k ) // some bad sounds
+ 		Sound_Process( &sc, SOUND_44k, sc->width, sc->channels, SOUND_RESAMPLE );
+ 
++	// the "Low" sound quality of the menu, as "loadas8bit" of GoldSrc
++	if( loadas8bit.value && sc->width == 2 )
++		Sound_Process( &sc, sc->rate, 1, sc->channels, SOUND_RESAMPLE );
++
+ 	sfx->cache = sc;
+ 
+ 	return sfx->cache;
+diff --git a/engine/client/sound/s_main.c b/engine/client/sound/s_main.c
+index 2cd7030..73315fa 100644
+--- a/engine/client/sound/s_main.c
++++ b/engine/client/sound/s_main.c
+@@ -56,6 +56,7 @@ CVAR_DEFINE_AUTO( snd_mute_losefocus, "1", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "sile
+ CVAR_DEFINE_AUTO( s_test, "0", 0, "engine developer cvar for quick testing new features" );
+ CVAR_DEFINE_AUTO( s_samplecount, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "sample count (0 for default value)" );
+ CVAR_DEFINE_AUTO( s_warn_late_precache, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "warn about late precached sounds on client-side" );
++CVAR_DEFINE_AUTO( loadas8bit, "0", FCVAR_ARCHIVE|FCVAR_FILTERABLE, "load the sounds as 8-bit (GoldSrc compatible cvar: \"Low\" sound quality of the menu)" );
+ 
+ /*
+ =============================================================================
+@@ -1991,6 +1992,7 @@ qboolean S_Init( void )
+ 	Cvar_RegisterVariable( &s_test );
+ 	Cvar_RegisterVariable( &s_samplecount );
+ 	Cvar_RegisterVariable( &s_warn_late_precache );
++	Cvar_RegisterVariable( &loadas8bit );
+ 
+ 	if( Sys_CheckParm( "-nosound" ))
+ 	{
+diff --git a/engine/client/sound/voice.c b/engine/client/sound/voice.c
+index c44345d..88a41fa 100644
+--- a/engine/client/sound/voice.c
++++ b/engine/client/sound/voice.c
+@@ -31,6 +31,17 @@ static CVAR_DEFINE_AUTO( voice_transmit_scale, "1.0", FCVAR_PRIVILEGED | FCVAR_A
+ static CVAR_DEFINE_AUTO( voice_avggain, "0.5", FCVAR_PRIVILEGED | FCVAR_ARCHIVE, "automatic voice gain control (average)" );
+ static CVAR_DEFINE_AUTO( voice_maxgain, "5.0", FCVAR_PRIVILEGED | FCVAR_ARCHIVE, "automatic voice gain control (maximum)" );
+ static CVAR_DEFINE_AUTO( voice_inputfromfile, "0", FCVAR_PRIVILEGED, "input voice from voice_input.wav" );
++static CVAR_DEFINE_AUTO( voice_boost, "0", FCVAR_PRIVILEGED | FCVAR_ARCHIVE, "microphone boost: four times the maximum automatic gain (the Voice page of the menu)" );
++
++// the test of the microphone of the menu of the Steam version (steamui_int.h): the voice is played back, its level is known
++static struct
++{
++	qboolean active;
++	qboolean own_init; // the voice was started for the test (not on a server)
++	float    level;
++} voicetest;
++
++static void Voice_Shutdown( void );
+ 
+ static void Voice_StartChannel( uint samples, byte *data, int entnum );
+ 
+@@ -410,7 +421,7 @@ static void Voice_ApplyGainAdjust( int16_t *samples, int count, float scale )
+ 			float modifiedMax = average + ( localMax - average ) * voice_avggain.value;
+ 
+ 			voice.autogain.current_gain = voice.autogain.next_gain * scale;
+-			voice.autogain.next_gain = Q_min((float)SHRT_MAX / ( modifiedMax > 1 ? modifiedMax : 1 ), voice_maxgain.value ) * scale;
++			voice.autogain.next_gain = Q_min((float)SHRT_MAX / ( modifiedMax > 1 ? modifiedMax : 1 ), voice_maxgain.value * ( voice_boost.value ? 4.0f : 1.0f )) * scale;
+ 			if( blockSize > 1 )
+ 				voice.autogain.gain_multiplier = ( voice.autogain.next_gain - voice.autogain.current_gain ) / ( blockSize - 1 );
+ 			else
+@@ -1030,6 +1041,9 @@ void CL_AddVoiceToDatagram( void )
+ 	if( cls.state != ca_active || !voice.device_opened || !Voice_IsRecording())
+ 		return;
+ 
++	if( voicetest.active )
++		return; // the test of the microphone takes the voice
++
+ 	if( voice.goldsrc )
+ 	{
+ 		if( !voice.gs_encoder )
+@@ -1076,6 +1090,7 @@ void Voice_RegisterCvars( void )
+ 	Cvar_RegisterVariable( &voice_avggain );
+ 	Cvar_RegisterVariable( &voice_maxgain );
+ 	Cvar_RegisterVariable( &voice_inputfromfile );
++	Cvar_RegisterVariable( &voice_boost );
+ }
+ 
+ /*
+@@ -1130,6 +1145,89 @@ void Voice_Idle( double frametime )
+ 
+ 	// update local player status first
+ 	Voice_StatusTimeout( &voice.local, VOICE_LOOPBACK_INDEX, frametime );
++
++	// the test of the microphone: the voice back to the speakers, its level for the menu
++	if( voicetest.active )
++	{
++		int count, peak = 0;
++
++		if( !Voice_IsRecording( ) || voice.input_file )
++		{
++			voicetest.level = 0.0f;
++			return;
++		}
++
++		VoiceCapture_Lock( true );
++		count = voice.input_buffer_pos / voice.width;
++		if( count > 0 )
++		{
++			int16_t *samples = (int16_t *)voice.input_buffer;
++
++			Voice_ApplyGainAdjust( samples, count, voice_transmit_scale.value );
++			for( int i = 0; i < count; i++ )
++				peak = Q_max( peak, abs( samples[i] ));
++
++			S_RawEntSamples( VOICE_LOOPBACK_INDEX, count, voice.samplerate, voice.width, VOICE_PCM_CHANNELS,
++				voice.input_buffer, bound( 0, 255 * voice_scale.value, 255 ), ATTN_NONE );
++			voice.input_buffer_pos = 0;
++		}
++		VoiceCapture_Lock( false );
++
++		// the meter falls slowly, as the one of GameUI
++		voicetest.level = Q_max( peak / 32767.0f, voicetest.level * 0.85f );
++	}
++}
++
++/*
++=========================
++Voice_Test
++
++the test of the microphone of the menu: 1 starts it (the voice system is started for it when not on a server),
++0 stops it; returns 1 while the microphone records
++=========================
++*/
++int Voice_Test( int start )
++{
++	if( !start )
++	{
++		if( voicetest.active )
++		{
++			voicetest.active = false;
++			Voice_RecordStop();
++			if( voicetest.own_init && cls.state != ca_active )
++				Voice_Shutdown();
++		}
++		voicetest.own_init = false;
++		voicetest.level = 0.0f;
++		return 0;
++	}
++
++	if( voicetest.active )
++		return 1;
++
++	if( !voice.initialized )
++	{
++		if( !Voice_Init( VOICE_DEFAULT_CODEC, 3, false ))
++			return 0;
++		voicetest.own_init = true;
++	}
++
++	if( !voice.device_opened )
++	{
++		Voice_Test( 0 );
++		return 0;
++	}
++
++	Voice_RecordStart();
++	voicetest.active = Voice_IsRecording() && !voice.input_file;
++	if( !voicetest.active )
++		Voice_Test( 0 );
++	return voicetest.active;
++}
++
++float Voice_TestLevel( void )
++{
++	return voicetest.active ? bound( 0.0f, voicetest.level, 1.0f ) : 0.0f;
+ }
+ 
+ /*
+diff --git a/engine/client/voice.h b/engine/client/voice.h
+index 69e0ec2..bef4f26 100644
+--- a/engine/client/voice.h
++++ b/engine/client/voice.h
+@@ -131,6 +131,8 @@ void Voice_Disconnect( void );
+ void Voice_AddIncomingData( int ent, const byte *data, uint size, uint frames );
+ void Voice_StopChannel( int entnum );
+ void Voice_LoopbackAck( void ); // sends VOICE_LOOPBACK_INDEX to client, gets disabled on timeout
++int Voice_Test( int start ); // the test of the microphone of the menu: the voice is played back, its level is known
++float Voice_TestLevel( void );
+ voice_audio_info_t Voice_GetAudioInfo( void );
+ 
+ #endif // VOICE_H
+diff --git a/engine/steamui_int.h b/engine/steamui_int.h
+new file mode 100644
+index 0000000..e17dc86
+--- /dev/null
++++ b/engine/steamui_int.h
+@@ -0,0 +1,75 @@
++/*
++steamui_int.h - the extension of the menu interface for the menu of the Steam version (cs16-client mainui)
++
++This program is free software: you can redistribute it and/or modify
++it under the terms of the GNU General Public License as published by
++the Free Software Foundation, either version 3 of the License, or
++(at your option) any later version.
++
++This program is distributed in the hope that it will be useful,
++but WITHOUT ANY WARRANTY; without even the implied warranty of
++MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++GNU General Public License for more details.
++*/
++
++// The same file is in the engine (engine/steamui_int.h) and in the menu (3rdparty/mainui_cpp/steamui_int.h).
++//
++// A menu that draws the console and the loading window itself, as GameUI of the Steam version, exports
++// "GetSteamUIAPI". The engine finds it after GetMenuAPI and GetExtAPI; without it (any other menu, or this menu
++// with another engine) everything stays as before. The structures are only added to at their ends, with a new version.
++
++#ifndef STEAMUI_INT_H
++#define STEAMUI_INT_H
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define STEAMUI_API_VERSION 1
++#define STEAMUI_EXPORT_NAME "GetSteamUIAPI"
++
++// what the menu does itself
++#define STEAMUI_FEATURE_CONSOLE   ( 1 << 0 ) // the console window: the engine doesn't draw its console
++#define STEAMUI_FEATURE_LOADING   ( 1 << 1 ) // the loading window: the menu stays open while connecting and loading
++
++// the engine for the menu
++typedef struct steamui_enginefuncs_s
++{
++	// the text to the clipboard of the system
++	void  (*pfnSetClipboardText)( const char *text );
++
++	// the commands and the variables beginning with "partial", for the list under the field of the console:
++	// "name\tvalue\n" for a variable, "name\n" for a command, sorted, at most "max" of them; returns their number
++	int   (*pfnCompleteCommand)( const char *partial, char *out, int outsize, int max );
++
++	// a line typed in the console window: printed as "] line", kept in the history of the commands and executed
++	void  (*pfnConsoleCommand)( const char *line );
++
++	// the test of the microphone of the Voice page: the voice is played back and its level (0..1) is known
++	int   (*pfnVoiceTest)( int start ); // 1 if the microphone is open
++	float (*pfnVoiceLevel)( void );     // the last level of the microphone, 0..1
++} steamui_enginefuncs_t;
++
++// the menu for the engine
++typedef struct steamui_functions_s
++{
++	// STEAMUI_FEATURE_*: what the menu does now (the menu of the Steam version can be turned off while the game runs)
++	int  (*pfnGetFeatures)( void );
++
++	// the console window: shown or hidden (the menu is active when it is shown), and whether it is shown now
++	void (*pfnConsoleShow)( int show );
++	int  (*pfnConsoleVisible)( void );
++
++	// a text printed to the console: one or more lines, may end without a line end (the line goes on then);
++	// the colours of the engine ("^1" and so on) are left in
++	void (*pfnConsolePrint)( const char *text );
++	void (*pfnConsoleClear)( void );
++} steamui_functions_t;
++
++typedef int (*STEAMUIAPI)( int version, steamui_functions_t *pFunctionTable, const steamui_enginefuncs_t *pEngfuncs );
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif // STEAMUI_INT_H
